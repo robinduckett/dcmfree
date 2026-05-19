@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build dcmfree.exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --verbose
+
+      - name: Run tests
+        run: cargo test --release --verbose
+
+      - name: Stage release artifacts
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $stage = "dist"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item target\release\dcmfree.exe $stage\dcmfree.exe
+          Copy-Item README.md $stage\README.md
+          Copy-Item LICENSE $stage\LICENSE
+          Compress-Archive -Path $stage\* -DestinationPath "dcmfree-$version-windows-x64.zip"
+          (Get-FileHash "dcmfree-$version-windows-x64.zip" -Algorithm SHA256).Hash | Out-File "dcmfree-$version-windows-x64.zip.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dcmfree-windows-x64
+          path: |
+            dcmfree-*.zip
+            dcmfree-*.zip.sha256
+
+  release:
+    name: create release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dcmfree-windows-x64
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/dcmfree-*.zip
+            artifacts/dcmfree-*.zip.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: false
