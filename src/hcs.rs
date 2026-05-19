@@ -15,17 +15,19 @@
 //! - [`HcsApi`] — zero-sized handle that exposes the user-facing methods
 //!   `destroy_layer` and `enumerate_compute_systems`.
 
-use crate::errors::DcmFreeError;
-use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
 
+use serde::Deserialize;
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::System::HostComputeSystem::{
     HCS_OPERATION, HcsCloseOperation, HcsCreateOperation, HcsDestroyLayer,
     HcsEnumerateComputeSystems, HcsWaitForOperationResult,
 };
 use windows::core::{PCWSTR, PWSTR};
+
+use crate::errors::DcmFreeError;
+use crate::util::wide_nul;
 
 // ---- public types ----------------------------------------------------------
 
@@ -67,7 +69,7 @@ impl HcsApi {
     /// operation handle. Caller MUST be elevated and have `SeBackupPrivilege`
     /// + `SeRestorePrivilege` enabled on the current token.
     pub fn destroy_layer(self, path: &Path) -> Result<(), DcmFreeError> {
-        let wide = to_wide(&path.as_os_str().to_string_lossy());
+        let wide = wide_nul(&path.as_os_str().to_string_lossy());
 
         // SAFETY: `wide` is a NUL-terminated UTF-16 buffer owned by us for
         // the duration of the call; `HcsDestroyLayer` does not retain it.
@@ -181,10 +183,6 @@ impl Drop for HcsOperation {
 }
 
 // ---- helpers ---------------------------------------------------------------
-
-fn to_wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
 
 /// RAII wrapper around a `LocalAlloc`-backed UTF-16 buffer returned from an
 /// HCS API. Drop calls `LocalFree`, so the buffer cannot leak even if a

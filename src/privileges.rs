@@ -9,8 +9,8 @@
 //! close on drop, even on panic. Manual `CloseHandle` is not used anywhere
 //! in this module.
 
-use crate::errors::DcmFreeError;
 use std::io;
+
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LUID};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
@@ -19,6 +19,9 @@ use windows::Win32::Security::{
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::IsUserAnAdmin;
 use windows::core::PCWSTR;
+
+use crate::errors::DcmFreeError;
+use crate::util::wide_nul;
 
 /// True when the current process token is a member of the Administrators group.
 #[must_use]
@@ -78,7 +81,7 @@ fn enable_privilege(name: &str) -> Result<(), DcmFreeError> {
         .map_err(|e| priv_err(name, &e))?;
 
     let mut luid = LUID::default();
-    let name_wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let name_wide = wide_nul(name);
 
     // SAFETY: `name_wide` is a NUL-terminated UTF-16 buffer owned by us
     // for the duration of the call. `&raw mut luid` is a valid out-pointer.

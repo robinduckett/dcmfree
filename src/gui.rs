@@ -168,7 +168,7 @@ impl App {
         // If a worker is running, ask it to stop before we tear down the
         // event loop so we don't leave a half-completed destroy behind.
         if let Some(cancel) = self.state.borrow().cancel.as_ref() {
-            cancel.store(true, Ordering::SeqCst);
+            cancel.store(true, Ordering::Relaxed);
         }
         nwg::stop_thread_dispatch();
     }
@@ -284,7 +284,7 @@ impl App {
 
         thread::spawn(move || {
             for (layers_index, id, size_bytes, path) in payload {
-                if cancel_for_thread.load(Ordering::SeqCst) {
+                if cancel_for_thread.load(Ordering::Relaxed) {
                     let _ = tx.send(WorkerMsg::DestroyDone {
                         layers_index,
                         row: OutcomeRow {
@@ -339,11 +339,15 @@ impl App {
         let mut scan_finished = false;
         let mut scan_error: Option<String> = None;
         let mut destroyed_rows: Vec<usize> = Vec::new();
+        let now_batch = SystemTime::now();
         for msg in messages {
             match msg {
                 // -------- scan ----------
                 WorkerMsg::ScanLayer(info) => {
-                    self.append_layer_row(&info);
+                    // `now` is captured once per drained batch — typical
+                    // batches arrive within microseconds of each other, and
+                    // a single timestamp is fine for display.
+                    self.append_layer_row(&info, now_batch);
                     self.state.borrow_mut().layers.push(*info);
                 }
                 WorkerMsg::ScanError(e) => {
@@ -539,8 +543,7 @@ impl App {
         });
     }
 
-    fn append_layer_row(&self, info: &LayerInfo) {
-        let now = SystemTime::now();
+    fn append_layer_row(&self, info: &LayerInfo, now: SystemTime) {
         let row_idx = self.state.borrow().layers.len();
         self.list.insert_items_row(
             Some(i32::try_from(row_idx).unwrap_or(i32::MAX)),

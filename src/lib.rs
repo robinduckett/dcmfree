@@ -23,6 +23,7 @@ pub mod gui;
 pub mod hcs;
 pub mod layers;
 pub mod privileges;
+pub mod util;
 
 /// Default path for HCS-managed container layers on Windows.
 pub const DEFAULT_LAYERS_DIR: &str = r"C:\ProgramData\Microsoft\Windows\Containers\Layers";

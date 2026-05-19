@@ -40,8 +40,8 @@ pub fn in_use_layer_dirs() -> HashSet<PathBuf> {
         return out;
     }
 
-    let mut ids = list_ids("images");
-    ids.extend(list_ids("ps -a"));
+    let mut ids = list_ids(&["images"]);
+    ids.extend(list_ids(&["ps", "-a"]));
 
     for id in ids {
         match inspect(&id) {
@@ -64,10 +64,9 @@ fn docker_available() -> bool {
         .unwrap_or(false)
 }
 
-fn list_ids(subcommand: &str) -> Vec<String> {
-    let parts: Vec<&str> = subcommand.split_whitespace().collect();
+fn list_ids(subcommand: &[&str]) -> Vec<String> {
     let mut cmd = Command::new("docker");
-    cmd.args(parts);
+    cmd.args(subcommand);
     cmd.args(["-q", "--no-trunc"]);
     let Ok(output) = cmd.output() else {
         return Vec::new();
@@ -89,7 +88,10 @@ fn inspect(id: &str) -> std::io::Result<Option<String>> {
     }
     let records: Vec<InspectRecord> = match serde_json::from_slice(&output.stdout) {
         Ok(v) => v,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            tracing::debug!("docker inspect {id}: JSON parse failed: {e}");
+            return Ok(None);
+        }
     };
     Ok(records
         .into_iter()

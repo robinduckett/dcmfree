@@ -11,6 +11,8 @@ use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 use windows::core::PCWSTR;
 
+use dcmfree::util::wide_nul;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
@@ -71,8 +73,8 @@ fn attach_parent_console() -> bool {
 /// attached (Explorer / Start-menu launch) so the user still sees the
 /// failure reason rather than the window vanishing silently.
 fn show_error_box(title: &str, body: &str) {
-    let title_w: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
-    let body_w: Vec<u16> = body.encode_utf16().chain(Some(0)).collect();
+    let title_w = wide_nul(title);
+    let body_w = wide_nul(body);
     // SAFETY: both buffers are NUL-terminated UTF-16 and live for the
     // duration of the call. MessageBoxW with a NULL owner is valid.
     unsafe {
