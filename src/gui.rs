@@ -178,15 +178,18 @@ impl App {
     }
 
     fn on_select_orphans(&self) {
-        let layers = self.state.borrow().layers.clone();
-        // Clear first, then select orphan rows.
-        for i in 0..layers.len() {
-            self.list.select_item(i, false);
-        }
-        for (i, l) in layers.iter().enumerate() {
-            if l.orphan {
-                self.list.select_item(i, true);
-            }
+        // Collect just the orphan flags so we can drop the borrow before
+        // touching ListView state (which would otherwise need a second
+        // borrow if `select_item` ever read shared state).
+        let orphan_flags: Vec<bool> = self
+            .state
+            .borrow()
+            .layers
+            .iter()
+            .map(|l| l.orphan)
+            .collect();
+        for (i, &is_orphan) in orphan_flags.iter().enumerate() {
+            self.list.select_item(i, is_orphan);
         }
         self.update_info();
     }

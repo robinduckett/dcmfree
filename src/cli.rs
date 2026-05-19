@@ -1,14 +1,18 @@
 //! Command-line entry point. Defines the user-facing subcommands and
 //! orchestrates the modules.
 
-use crate::DEFAULT_LAYERS_DIR;
-use crate::format::{age as fmt_age, bytes as fmt_bytes};
-use crate::layers::{self, LayerInfo};
-use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
+
+use anyhow::{Context, Result};
+use clap::{Args, Parser, Subcommand};
+
+use crate::DEFAULT_LAYERS_DIR;
+use crate::errors::DcmFreeError;
+use crate::format::{age as fmt_age, bytes as fmt_bytes};
+use crate::layers::{self, LayerInfo};
+use crate::{hcs, privileges};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -176,9 +180,6 @@ fn cmd_info(args: &CommonArgs) -> Result<()> {
 }
 
 fn cmd_clean(args: &CleanArgs) -> Result<()> {
-    use crate::errors::DcmFreeError;
-    use crate::{hcs, privileges};
-
     let layers = enumerate_and_classify(&args.common)?;
     let now = SystemTime::now();
     let targets = layers::orphans_older_than(&layers, args.min_age, now);
