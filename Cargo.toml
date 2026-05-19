@@ -1,8 +1,8 @@
 [package]
 name = "dcmfree"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.85"
 description = "Reclaim disk space by destroying orphan Windows container layers via the Host Compute Service API"
 license = "MIT"
 repository = "https://github.com/robinduckett/dcmfree"
@@ -25,7 +25,8 @@ walkdir = "2.5"
 bytesize = "1.3"
 humantime = "2.1"
 chrono = { version = "0.4", features = ["serde"] }
-
+native-windows-gui = "1.0"
+native-windows-derive = "1.0"
 # HCS storage APIs (HcsDestroyLayer etc.) are not in the official `windows`
 # crate as of 0.60 — only HostCompute/HostComputeNetwork/HostComputeSystem
 # are exposed. We declare the single function we need via raw FFI in
@@ -34,9 +35,14 @@ windows = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_HostComputeSystem",
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
+
+[build-dependencies]
+embed-resource = "2.5"
 
 [dev-dependencies]
 assert_cmd = "2.0"

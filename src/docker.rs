@@ -27,9 +27,11 @@ struct InspectRecord {
     graph_driver: Option<InspectGraphDriver>,
 }
 
-/// Return the set of layer directories Docker considers in use, across all
-/// images and containers in the *current* daemon mode. Best-effort: if `docker`
-/// isn't on PATH or returns an error, the set is empty.
+/// Return the set of layer directories Docker considers in use.
+///
+/// Includes layers used by all images and containers in the *current* daemon
+/// mode. Best-effort: if `docker` isn't on `PATH` or returns an error, the
+/// returned set is empty.
 pub fn in_use_layer_dirs() -> HashSet<PathBuf> {
     let mut out = HashSet::new();
 
@@ -127,20 +129,9 @@ mod tests {
         assert!(parsed[0].graph_driver.is_none());
     }
 
-    #[test]
-    fn in_use_dirs_is_empty_when_docker_missing() {
-        // Save/restore PATH so we can simulate a missing docker.
-        let original = std::env::var_os("PATH");
-        // SAFETY: tests in this crate are not run in parallel that race on PATH
-        unsafe {
-            std::env::set_var("PATH", "");
-        }
-        let result = in_use_layer_dirs();
-        if let Some(p) = original {
-            unsafe { std::env::set_var("PATH", p) };
-        } else {
-            unsafe { std::env::remove_var("PATH") };
-        }
-        assert!(result.is_empty());
-    }
+    // NB: we deliberately do not test the "docker not on PATH" branch from
+    // a unit test — that would require mutating the process-wide PATH env
+    // var, which is `unsafe` in Rust 2024 and races with any other test
+    // (or runtime thread) reading env vars. The branch is exercised by
+    // integration tests that run the binary in an environment without docker.
 }

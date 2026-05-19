@@ -4,12 +4,14 @@ use bytesize::ByteSize;
 use std::time::Duration;
 
 /// Format a byte count as a human-readable string (e.g. "1.23 GB").
+#[must_use]
 pub fn bytes(n: u64) -> String {
     ByteSize(n).to_string()
 }
 
 /// Format a `Duration` as a coarse-grained age string
 /// (e.g. "3 days", "5 hours", "just now").
+#[must_use]
 pub fn age(d: Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -43,7 +45,7 @@ mod tests {
     #[test]
     fn bytes_kib_boundary() {
         let s = bytes(1024);
-        assert!(s.starts_with("1"), "expected leading 1, got {s}");
+        assert!(s.starts_with('1'), "expected leading 1, got {s}");
         assert!(s.contains('K'), "expected K-unit suffix, got {s}");
     }
 

@@ -19,6 +19,7 @@ pub mod cli;
 pub mod docker;
 pub mod errors;
 pub mod format;
+pub mod gui;
 pub mod hcs;
 pub mod layers;
 pub mod privileges;

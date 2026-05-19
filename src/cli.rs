@@ -1,9 +1,9 @@
 //! Command-line entry point. Defines the user-facing subcommands and
 //! orchestrates the modules.
 
+use crate::DEFAULT_LAYERS_DIR;
 use crate::format::{age as fmt_age, bytes as fmt_bytes};
 use crate::layers::{self, LayerInfo};
-use crate::DEFAULT_LAYERS_DIR;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::io::{self, IsTerminal, Write};
@@ -38,6 +38,8 @@ pub enum Command {
     Info(CommonArgs),
     /// Destroy orphan layers (requires Administrator + backup/restore privilege).
     Clean(CleanArgs),
+    /// Open the native Windows GUI.
+    Gui,
 }
 
 #[derive(Debug, Args)]
@@ -83,17 +85,20 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("invalid duration '{s}': {e}"))
 }
 
-/// Top-level entry called from `main.rs`. Returns Err only for unrecoverable
-/// failures; expected user-facing errors (e.g. not elevated) print a message
-/// and return Ok(()) with non-zero exit signalled by the caller's match.
+/// Top-level entry called from `main.rs`.
+///
+/// Returns `Err` only for unrecoverable failures; expected user-facing
+/// errors (e.g. not elevated) print a message and return `Ok(())` with the
+/// non-zero exit signalled by the caller's match.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
     match cli.command {
-        Command::List(a) => cmd_list(a),
-        Command::Info(a) => cmd_info(a),
-        Command::Clean(a) => cmd_clean(a),
+        Command::List(a) => cmd_list(&a),
+        Command::Info(a) => cmd_info(&a),
+        Command::Clean(a) => cmd_clean(&a),
+        Command::Gui => crate::gui::run(),
     }
 }
 
@@ -128,7 +133,7 @@ fn enumerate_and_classify(common: &CommonArgs) -> Result<Vec<LayerInfo>> {
     Ok(layers)
 }
 
-fn cmd_list(args: ListArgs) -> Result<()> {
+fn cmd_list(args: &ListArgs) -> Result<()> {
     let layers = enumerate_and_classify(&args.common)?;
     if args.common.json {
         let out = serde_json::to_string_pretty(&layers)?;
@@ -139,8 +144,8 @@ fn cmd_list(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_info(args: CommonArgs) -> Result<()> {
-    let layers = enumerate_and_classify(&args)?;
+fn cmd_info(args: &CommonArgs) -> Result<()> {
+    let layers = enumerate_and_classify(args)?;
     let total: u64 = layers.iter().map(|l| l.size_bytes).sum();
     let orphan: u64 = layers
         .iter()
@@ -152,7 +157,7 @@ fn cmd_info(args: CommonArgs) -> Result<()> {
 
     if args.json {
         let report = serde_json::json!({
-            "layers_dir": layers_dir(&args),
+            "layers_dir": layers_dir(args),
             "layer_count": known,
             "orphan_count": orphan_count,
             "total_bytes": total,
@@ -162,7 +167,7 @@ fn cmd_info(args: CommonArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("Layers directory: {}", layers_dir(&args).display());
+    println!("Layers directory: {}", layers_dir(args).display());
     println!("Total layers:     {known}");
     println!("Orphan layers:    {orphan_count}");
     println!("Total size:       {}", fmt_bytes(total));
@@ -170,7 +175,7 @@ fn cmd_info(args: CommonArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_clean(args: CleanArgs) -> Result<()> {
+fn cmd_clean(args: &CleanArgs) -> Result<()> {
     use crate::errors::DcmFreeError;
     use crate::{hcs, privileges};
 

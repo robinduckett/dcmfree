@@ -17,17 +17,27 @@ pub struct LayerInfo {
     pub path: PathBuf,
     pub id: String,
     pub size_bytes: u64,
-    /// Most recent file or directory mtime within this layer.
+    pub file_count: u64,
+    /// Creation time of the layer's top-level directory (NTFS `CreationTime`).
+    /// This never changes once the layer exists and is therefore the most
+    /// reliable measure of how old the layer is.
+    pub created_at: SystemTime,
+    /// Most recent mtime found inside this layer. Can be affected by tools
+    /// that touched files inside the layer (including failed delete attempts).
     pub last_modified: SystemTime,
+    /// Most recent atime on the layer's top-level directory. Often equal to
+    /// `created_at` because Windows disables last-access updates by default.
+    pub last_accessed: SystemTime,
     /// True when no live container/image references this layer.
     pub orphan: bool,
 }
 
 impl LayerInfo {
-    /// Age of the layer relative to `now`. Saturates at zero if the mtime is
-    /// in the future (clock skew, filesystem oddities).
+    /// Age of the layer relative to `now`, derived from `created_at`.
+    /// Saturates at zero if the timestamp is in the future.
+    #[must_use]
     pub fn age(&self, now: SystemTime) -> Duration {
-        now.duration_since(self.last_modified).unwrap_or_default()
+        now.duration_since(self.created_at).unwrap_or_default()
     }
 }
 
@@ -52,44 +62,67 @@ pub fn enumerate(dir: &Path) -> Result<Vec<LayerInfo>, DcmFreeError> {
             .and_then(|s| s.to_str())
             .unwrap_or("?")
             .to_string();
-        let (size_bytes, last_modified) = stat_dir(&path);
-        out.push(LayerInfo {
-            path,
-            id,
-            size_bytes,
-            last_modified,
-            orphan: true, // tentative; classifier will refine
-        });
+        out.push(stat_layer(path, id));
     }
     out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     Ok(out)
 }
 
-/// Total recursive size + most recent mtime found anywhere under `dir`.
-/// Tolerant of individual entry failures (typical inside HCS layer dirs
-/// because of reparse points the walker can't always read).
-fn stat_dir(dir: &Path) -> (u64, SystemTime) {
-    let mut size: u64 = 0;
-    let mut newest = std::fs::metadata(dir)
-        .and_then(|m| m.modified())
+/// Build a `LayerInfo` for a single layer directory.
+///
+/// Recursive walk for size + file count + max(mtime). Top-level directory
+/// metadata for `created_at` and `last_accessed` — those are the reliable
+/// timestamps (created never changes; atime usually equals created on
+/// Windows because last-access updates are disabled by default).
+///
+/// Tolerant of individual entry failures: reparse points and access-denied
+/// files inside HCS layers are common, and they just don't contribute to
+/// the size/count totals.
+#[must_use]
+pub fn stat_layer(path: PathBuf, id: String) -> LayerInfo {
+    let dir_md = std::fs::metadata(&path).ok();
+    let created_at = dir_md
+        .as_ref()
+        .and_then(|m| m.created().ok())
         .unwrap_or(SystemTime::UNIX_EPOCH);
+    let last_accessed = dir_md
+        .as_ref()
+        .and_then(|m| m.accessed().ok())
+        .unwrap_or(created_at);
+    let mut last_modified = dir_md.and_then(|m| m.modified().ok()).unwrap_or(created_at);
 
-    for entry in WalkDir::new(dir).into_iter().flatten() {
+    let mut size: u64 = 0;
+    let mut file_count: u64 = 0;
+    for entry in WalkDir::new(&path).into_iter().flatten() {
         let Ok(md) = entry.metadata() else { continue };
         if md.is_file() {
             size = size.saturating_add(md.len());
+            file_count = file_count.saturating_add(1);
         }
-        if let Ok(m) = md.modified() {
-            if m > newest {
-                newest = m;
-            }
+        if let Ok(m) = md.modified()
+            && m > last_modified
+        {
+            last_modified = m;
         }
     }
-    (size, newest)
+
+    LayerInfo {
+        path,
+        id,
+        size_bytes: size,
+        file_count,
+        created_at,
+        last_modified,
+        last_accessed,
+        orphan: true, // tentative; classifier will refine
+    }
 }
 
 /// Mark every layer whose path appears in `in_use` as non-orphan.
-pub fn classify(layers: &mut [LayerInfo], in_use: &std::collections::HashSet<PathBuf>) {
+pub fn classify<S: std::hash::BuildHasher>(
+    layers: &mut [LayerInfo],
+    in_use: &std::collections::HashSet<PathBuf, S>,
+) {
     for l in layers.iter_mut() {
         // Compare via canonicalized path when possible — Docker reports
         // case-insensitive paths on Windows and may use \\?\ prefixes.
@@ -112,6 +145,7 @@ fn strip_verbatim_prefix(p: &Path) -> String {
 }
 
 /// Filter a slice of `LayerInfo` to the orphan subset older than `min_age`.
+#[must_use]
 pub fn orphans_older_than(
     layers: &[LayerInfo],
     min_age: Duration,
@@ -185,31 +219,27 @@ mod tests {
         assert!(by_id["layer-b"]);
     }
 
+    fn fake_layer(id: &str, age_secs: u64, orphan: bool) -> LayerInfo {
+        let now = SystemTime::now();
+        LayerInfo {
+            path: PathBuf::from(id),
+            id: id.into(),
+            size_bytes: 10,
+            file_count: 1,
+            created_at: now - Duration::from_secs(age_secs),
+            last_modified: now - Duration::from_secs(age_secs),
+            last_accessed: now - Duration::from_secs(age_secs),
+            orphan,
+        }
+    }
+
     #[test]
     fn orphans_older_than_filters_by_age_and_orphan_status() {
         let now = SystemTime::now();
         let layers = vec![
-            LayerInfo {
-                path: PathBuf::from("a"),
-                id: "a".into(),
-                size_bytes: 10,
-                last_modified: now - Duration::from_secs(10 * 86_400),
-                orphan: true,
-            },
-            LayerInfo {
-                path: PathBuf::from("b"),
-                id: "b".into(),
-                size_bytes: 20,
-                last_modified: now - Duration::from_secs(60),
-                orphan: true,
-            },
-            LayerInfo {
-                path: PathBuf::from("c"),
-                id: "c".into(),
-                size_bytes: 30,
-                last_modified: now - Duration::from_secs(10 * 86_400),
-                orphan: false,
-            },
+            fake_layer("a", 10 * 86_400, true),
+            fake_layer("b", 60, true),
+            fake_layer("c", 10 * 86_400, false),
         ];
         let picked = orphans_older_than(&layers, Duration::from_secs(86_400), now);
         let ids: Vec<&str> = picked.iter().map(|l| l.id.as_str()).collect();
@@ -217,13 +247,16 @@ mod tests {
     }
 
     #[test]
-    fn age_saturates_for_future_mtimes() {
+    fn age_saturates_for_future_creation_time() {
         let now = SystemTime::now();
         let l = LayerInfo {
             path: PathBuf::from("a"),
             id: "a".into(),
             size_bytes: 0,
-            last_modified: now + Duration::from_secs(3600),
+            file_count: 0,
+            created_at: now + Duration::from_secs(3600),
+            last_modified: now,
+            last_accessed: now,
             orphan: true,
         };
         assert_eq!(l.age(now), Duration::ZERO);

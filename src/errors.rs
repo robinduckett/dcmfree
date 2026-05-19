@@ -20,6 +20,14 @@ pub enum DcmFreeError {
     #[error("HcsDestroyLayer failed for {path}: HRESULT 0x{hresult:08X}")]
     HcsDestroyFailed { path: PathBuf, hresult: u32 },
 
+    #[error("HCS operation failed ({operation}): HRESULT 0x{hresult:08X}{}",
+        if details.is_empty() { String::new() } else { format!(" — {details}") })]
+    HcsOperationFailed {
+        operation: String,
+        hresult: u32,
+        details: String,
+    },
+
     #[error("docker query failed: {0}")]
     DockerQueryFailed(String),
 

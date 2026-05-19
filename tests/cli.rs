@@ -1,5 +1,5 @@
 //! End-to-end CLI tests that drive the built binary against a temp dir of
-//! fake "layers". We never actually call HcsDestroyLayer here — that would
+//! fake "layers". We never actually call `HcsDestroyLayer` here — that would
 //! require Administrator and modify global state.
 
 use assert_cmd::Command;
