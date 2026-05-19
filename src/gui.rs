@@ -11,13 +11,6 @@
 //! finishes (cancelled or not) the results are shown in a scrollable modal
 //! dialog with full per-layer outcome and a summary footer.
 
-use crate::format::{age as fmt_age, bytes as fmt_bytes};
-use crate::layers::{self, LayerInfo};
-use crate::{DEFAULT_LAYERS_DIR, hcs, privileges};
-use chrono::{DateTime, Local};
-use native_windows_derive::NwgUi;
-use native_windows_gui as nwg;
-use nwg::NativeUi;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,10 +19,32 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::SystemTime;
 
+use chrono::{DateTime, Local};
+use native_windows_derive::NwgUi;
+use native_windows_gui as nwg;
+use nwg::NativeUi;
+
+use crate::format::{age as fmt_age, bytes as fmt_bytes};
+use crate::hcs::{ComputeSystemSummary, HcsApi};
+use crate::layers::{self, LayerInfo};
+use crate::{DEFAULT_LAYERS_DIR, hcs, privileges};
+
+/// One active HCS compute system + the on-disk layer paths it holds open.
+/// Built during the scan worker by combining `enumerate_compute_systems`
+/// with one `system_layer_paths` call per system.
+#[derive(Debug, Clone)]
+struct SystemDetail {
+    summary: ComputeSystemSummary,
+    layer_paths: Vec<PathBuf>,
+}
+
 #[derive(Default)]
 struct AppState {
     layers_dir: PathBuf,
     layers: Vec<LayerInfo>,
+    // Snapshot of active HCS compute systems from the last scan, with
+    // their queried Storage layer paths.
+    hcs_systems: Vec<SystemDetail>,
     // Active job, if any (scan or destroy share the same notice + channel).
     receiver: Option<Receiver<WorkerMsg>>,
     cancel: Option<Arc<AtomicBool>>,
@@ -66,6 +81,8 @@ enum WorkerMsg {
     // Scan messages
     /// One layer fully stat-ed; ready to be displayed.
     ScanLayer(Box<LayerInfo>),
+    /// Active HCS compute systems + their queried Storage layer paths.
+    ScanHcsSystems(Vec<SystemDetail>),
     /// Whole layers dir failed to enumerate (e.g. not found).
     ScanError(String),
     /// Scan complete.
@@ -110,6 +127,10 @@ pub struct App {
     #[nwg_control(parent: window, text: "Clear selection", position: (270, 10), size: (130, 30))]
     #[nwg_events(OnButtonClick: [App::on_clear])]
     btn_clear: nwg::Button,
+
+    #[nwg_control(parent: window, text: "Active HCS systems...", position: (410, 10), size: (170, 30))]
+    #[nwg_events(OnButtonClick: [App::on_show_hcs])]
+    btn_show_hcs: nwg::Button,
 
     // -- info strip ----------------------------------------------------------
     #[nwg_control(
@@ -204,6 +225,11 @@ impl App {
 
     fn on_list_selection_changed(&self) {
         self.update_info();
+    }
+
+    fn on_show_hcs(&self) {
+        let details = self.state.borrow().hcs_systems.clone();
+        HcsSystemsDialog::show(&details);
     }
 
     fn on_destroy(&self) {
@@ -349,6 +375,10 @@ impl App {
                     // a single timestamp is fine for display.
                     self.append_layer_row(&info, now_batch);
                     self.state.borrow_mut().layers.push(*info);
+                }
+                WorkerMsg::ScanHcsSystems(systems) => {
+                    self.state.borrow_mut().hcs_systems = systems;
+                    self.update_info();
                 }
                 WorkerMsg::ScanError(e) => {
                     scan_error = Some(e);
@@ -497,6 +527,7 @@ impl App {
         {
             let mut st = self.state.borrow_mut();
             st.layers.clear();
+            st.hcs_systems.clear();
             st.receiver = Some(rx);
             st.cancel = None;
             st.job = Job::Scanning;
@@ -522,7 +553,50 @@ impl App {
                 }
             };
 
-            let in_use = crate::docker::in_use_layer_dirs();
+            // Build the union of "in use" layer paths from every source we
+            // can consult BEFORE classifying any layer. A layer is treated
+            // as in-use — and therefore NOT an orphan — if ANY source
+            // claims it:
+            //  - Docker's view (images + containers in the current daemon).
+            //  - The `runtime_image_path` reported by each active HCS
+            //    compute system in the enumerate JSON.
+            //  - The full `Storage.Layers` / `ReadOnlyLayers` /
+            //    `WritableLayer` set queried per system via
+            //    `HcsGetComputeSystemProperties`.
+            //
+            // We never rely on `HcsDestroyLayer` failing to discover that a
+            // layer is in use — that's after-the-fact; this is up-front.
+            let api = HcsApi::new();
+            let mut in_use = crate::docker::in_use_layer_dirs();
+            let summaries = api.enumerate_compute_systems().unwrap_or_default();
+            let mut details: Vec<SystemDetail> = Vec::with_capacity(summaries.len());
+            for summary in summaries {
+                if let Some(p) = summary.runtime_image_path.as_deref() {
+                    in_use.insert(PathBuf::from(p));
+                }
+                let layer_paths = match api.system_layer_paths(&summary.id) {
+                    Ok(paths) => {
+                        for p in &paths {
+                            in_use.insert(p.clone());
+                        }
+                        paths
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "HcsGetComputeSystemProperties failed for {}: {e}",
+                            summary.id
+                        );
+                        Vec::new()
+                    }
+                };
+                details.push(SystemDetail {
+                    summary,
+                    layer_paths,
+                });
+            }
+            let _ = tx.send(WorkerMsg::ScanHcsSystems(details));
+            sender.notice();
+
             for entry in entries.flatten() {
                 let path = entry.path();
                 if !path.is_dir() {
@@ -580,11 +654,12 @@ impl App {
         let orphan_count = state.layers.iter().filter(|l| l.orphan).count();
 
         self.info_label.set_text(&format!(
-            "Layers: {}    Orphans: {} ({})    On disk: {}    Selected: {} ({})",
+            "Layers: {}    Orphans: {} ({})    On disk: {}    Active HCS: {}    Selected: {} ({})",
             state.layers.len(),
             orphan_count,
             fmt_bytes(orphan_size),
             fmt_bytes(total_size),
+            state.hcs_systems.len(),
             selected.len(),
             fmt_bytes(sel_size),
         ));
@@ -734,6 +809,119 @@ impl ReportDialog {
 fn format_timestamp(ts: SystemTime) -> String {
     let dt: DateTime<Local> = ts.into();
     dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// Scrollable list of active HCS compute systems. Opened from the
+/// "Active HCS systems..." button. Read-only; the contents are a
+/// snapshot from the last scan.
+#[derive(Default, NwgUi)]
+pub struct HcsSystemsDialogUi {
+    #[nwg_control(
+        size: (980, 460),
+        title: "dcmfree - active HCS compute systems",
+        flags: "WINDOW|VISIBLE"
+    )]
+    #[nwg_events(OnWindowClose: [HcsSystemsDialogUi::on_close])]
+    window: nwg::Window,
+
+    #[nwg_control(parent: window, text: "", position: (10, 10), size: (960, 24))]
+    summary: nwg::Label,
+
+    #[nwg_control(
+        parent: window,
+        position: (10, 40),
+        size: (960, 370),
+        list_style: nwg::ListViewStyle::Detailed,
+        ex_flags: nwg::ListViewExFlags::FULL_ROW_SELECT
+                | nwg::ListViewExFlags::GRID
+    )]
+    list: nwg::ListView,
+
+    #[nwg_control(parent: window, text: "Close", position: (880, 420), size: (90, 32))]
+    #[nwg_events(OnButtonClick: [HcsSystemsDialogUi::on_close])]
+    btn_close: nwg::Button,
+}
+
+impl HcsSystemsDialogUi {
+    fn on_close(&self) {
+        self.window.set_visible(false);
+    }
+}
+
+struct HcsSystemsDialog;
+
+impl HcsSystemsDialog {
+    fn show(details: &[SystemDetail]) {
+        // Leak intentionally: one-shot per click, OS reclaims on exit.
+        let ui: &'static HcsSystemsDialogUi = Box::leak(Box::new(
+            HcsSystemsDialogUi::build_ui(HcsSystemsDialogUi::default())
+                .expect("failed to build HCS systems dialog"),
+        ));
+
+        let cols: &[(&str, i32)] = &[
+            ("ID", 230),
+            ("Type", 100),
+            ("State", 80),
+            ("Owner", 90),
+            ("Name", 130),
+            ("Layers", 60),
+            ("Storage layer paths", 250),
+        ];
+        for (i, (name, width)) in cols.iter().enumerate() {
+            ui.list.insert_column(nwg::InsertListViewColumn {
+                index: Some(i32::try_from(i).unwrap_or(i32::MAX)),
+                text: Some((*name).into()),
+                width: Some(*width),
+                fmt: None,
+            });
+        }
+        ui.list.set_headers_enabled(true);
+
+        if details.is_empty() {
+            ui.summary
+                .set_text("No active HCS compute systems on this machine.");
+            return;
+        }
+
+        let total_layers: usize = details.iter().map(|d| d.layer_paths.len()).sum();
+        ui.summary.set_text(&format!(
+            "{} active HCS compute system(s); {} layer reference(s) total.",
+            details.len(),
+            total_layers
+        ));
+        for (i, detail) in details.iter().enumerate() {
+            let row = i32::try_from(i).unwrap_or(i32::MAX);
+            // Join all layer paths with "; " for the table cell. Falls back
+            // to RuntimeImagePath when the Storage query returned nothing
+            // (e.g. utility VMs that don't expose a layer chain).
+            let paths_cell = if detail.layer_paths.is_empty() {
+                detail
+                    .summary
+                    .runtime_image_path
+                    .clone()
+                    .unwrap_or_default()
+            } else {
+                detail
+                    .layer_paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            ui.list.insert_items_row(
+                Some(row),
+                &[
+                    detail.summary.id.clone(),
+                    detail.summary.system_type.clone().unwrap_or_default(),
+                    detail.summary.state.clone().unwrap_or_default(),
+                    detail.summary.owner.clone().unwrap_or_default(),
+                    detail.summary.name.clone().unwrap_or_default(),
+                    detail.layer_paths.len().to_string(),
+                    paths_cell,
+                ],
+            );
+        }
+    }
 }
 
 /// Public entry point — initialise nwg and run the message loop.

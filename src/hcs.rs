@@ -15,14 +15,15 @@
 //! - [`HcsApi`] — zero-sized handle that exposes the user-facing methods
 //!   `destroy_layer` and `enumerate_compute_systems`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::System::HostComputeSystem::{
-    HCS_OPERATION, HcsCloseOperation, HcsCreateOperation, HcsDestroyLayer,
-    HcsEnumerateComputeSystems, HcsWaitForOperationResult,
+    HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation, HcsCreateOperation,
+    HcsDestroyLayer, HcsEnumerateComputeSystems, HcsGetComputeSystemProperties,
+    HcsOpenComputeSystem, HcsWaitForOperationResult,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -82,6 +83,36 @@ impl HcsApi {
                 hresult,
             }
         })
+    }
+
+    /// Return the on-disk layer paths held by the named active compute
+    /// system, by opening it and asking for the `Storage` property.
+    ///
+    /// Best-effort: returns an empty `Vec` when the system exposes no
+    /// `Storage` info (some virtualized utility VMs don't). Errors are
+    /// reported up the chain — callers usually want to log and continue.
+    pub fn system_layer_paths(self, id: &str) -> Result<Vec<PathBuf>, DcmFreeError> {
+        let system = OwnedComputeSystem::open(id)?;
+        let op = HcsOperation::new()?;
+        let query = wide_nul(r#"{"PropertyTypes":["Storage"]}"#);
+
+        // SAFETY: `query` is a NUL-terminated UTF-16 buffer owned for the
+        // duration of the call; `system.handle` is a live HCS_SYSTEM and
+        // `op.handle` is a live HCS_OPERATION (both Drop on their wrappers).
+        unsafe { HcsGetComputeSystemProperties(system.handle, op.handle, PCWSTR(query.as_ptr())) }
+            .map_err(|e| make_op_error("HcsGetComputeSystemProperties", &e, ""))?;
+
+        let json = op.wait_for_result(Some(Duration::from_secs(15)))?;
+        if json.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| DcmFreeError::HcsOperationFailed {
+                operation: "HcsGetComputeSystemProperties".into(),
+                hresult: 0,
+                details: format!("invalid JSON: {e}"),
+            })?;
+        Ok(extract_storage_layer_paths(&value))
     }
 
     /// Enumerate every active HCS compute system on the machine.
@@ -180,6 +211,59 @@ impl Drop for HcsOperation {
             unsafe { HcsCloseOperation(self.handle) };
         }
     }
+}
+
+/// RAII wrapper around an `HCS_SYSTEM` handle from `HcsOpenComputeSystem`.
+/// `HcsCloseComputeSystem` runs on drop.
+struct OwnedComputeSystem {
+    handle: HCS_SYSTEM,
+}
+
+impl OwnedComputeSystem {
+    fn open(id: &str) -> Result<Self, DcmFreeError> {
+        let wide = wide_nul(id);
+        // SAFETY: `wide` is a NUL-terminated UTF-16 buffer owned for the
+        // duration of the call. Access mask 0 requests the default
+        // (generic-read) access, which is enough for property queries.
+        let handle = unsafe { HcsOpenComputeSystem(PCWSTR(wide.as_ptr()), 0) }
+            .map_err(|e| make_op_error("HcsOpenComputeSystem", &e, id))?;
+        Ok(Self { handle })
+    }
+}
+
+impl Drop for OwnedComputeSystem {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() {
+            // SAFETY: handle was returned by HcsOpenComputeSystem; Drop is
+            // one-shot per OwnedComputeSystem instance.
+            unsafe { HcsCloseComputeSystem(self.handle) };
+        }
+    }
+}
+
+/// Permissively extract layer paths from a `HcsGetComputeSystemProperties`
+/// response. The schema varies a little between Windows builds, so we look
+/// in several places under `Storage` and collect any `Path` field we find.
+fn extract_storage_layer_paths(v: &serde_json::Value) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(storage) = v.get("Storage") else {
+        return out;
+    };
+    for key in ["Layers", "ReadOnlyLayers"] {
+        if let Some(arr) = storage.get(key).and_then(serde_json::Value::as_array) {
+            for entry in arr {
+                if let Some(p) = entry.get("Path").and_then(serde_json::Value::as_str) {
+                    out.push(PathBuf::from(p));
+                }
+            }
+        }
+    }
+    if let Some(wl) = storage.get("WritableLayer")
+        && let Some(p) = wl.get("Path").and_then(serde_json::Value::as_str)
+    {
+        out.push(PathBuf::from(p));
+    }
+    out
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -328,6 +412,41 @@ mod tests {
     fn deserialise_empty_enumerate_payload() {
         let parsed: Vec<ComputeSystemSummary> = serde_json::from_str("[]").unwrap();
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn extract_storage_layer_paths_handles_layers_array() {
+        let raw = serde_json::json!({
+            "Storage": {
+                "Layers": [
+                    { "Id": "a", "Path": "C:\\ProgramData\\X\\a" },
+                    { "Id": "b", "Path": "C:\\ProgramData\\X\\b" }
+                ]
+            }
+        });
+        let paths = extract_storage_layer_paths(&raw);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], PathBuf::from(r"C:\ProgramData\X\a"));
+    }
+
+    #[test]
+    fn extract_storage_layer_paths_handles_readonly_and_writable() {
+        let raw = serde_json::json!({
+            "Storage": {
+                "ReadOnlyLayers": [ { "Path": "C:\\ro" } ],
+                "WritableLayer": { "Path": "C:\\rw" }
+            }
+        });
+        let paths = extract_storage_layer_paths(&raw);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&PathBuf::from(r"C:\ro")));
+        assert!(paths.contains(&PathBuf::from(r"C:\rw")));
+    }
+
+    #[test]
+    fn extract_storage_layer_paths_handles_missing_storage() {
+        let raw = serde_json::json!({ "Id": "abc", "State": "Running" });
+        assert!(extract_storage_layer_paths(&raw).is_empty());
     }
 
     #[test]

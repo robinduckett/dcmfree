@@ -1,147 +1,67 @@
 # dcmfree
 
-**Disk Cleanup for Microsoft Containers — Free space stuck in orphan layers.**
+Reclaim disk space taken by orphan Windows container layers in
+`C:\ProgramData\Microsoft\Windows\Containers\Layers`. Native GUI + CLI in
+one binary.
 
-A small Windows CLI that reclaims disk space taken by orphan container layers
-in `C:\ProgramData\Microsoft\Windows\Containers\Layers`. These accumulate from
-Windows-containers-mode Docker, Windows Sandbox sessions that didn't clean up,
-and old Hyper-V container activity. They're full of NTFS reparse points and
-hardlinks that ordinary `del` / `Remove-Item` cannot delete — even from an
-elevated prompt — because they require `SeBackupPrivilege` /
-`SeRestorePrivilege` and the proper HCS API.
-
-`dcmfree` calls `HcsDestroyLayer` from `computestorage.dll` after enabling the
-right privileges. That's the supported way to remove these.
+These layers are full of NTFS reparse points and hardlinks that
+`del` / `Remove-Item` cannot remove — they need `SeBackupPrivilege` +
+`SeRestorePrivilege` and the HCS `HcsDestroyLayer` API. That's what
+`dcmfree` does.
 
 ## Install
 
-### From a release
-
-Download the latest `dcmfree.exe` from the
-[Releases](https://github.com/robinduckett/dcmfree/releases) page, drop it
-anywhere on your `PATH`.
-
-### From source
+Grab `dcmfree.exe` from the
+[Releases](https://github.com/robinduckett/dcmfree/releases) page, or
+build from source:
 
 ```powershell
-git clone https://github.com/robinduckett/dcmfree
-cd dcmfree
-cargo build --release
-# Binary is at target\release\dcmfree.exe
+cargo build --release   # needs Rust 1.85+ (edition 2024)
 ```
-
-Requires Rust 1.75 or later.
 
 ## Usage
 
-All commands accept `--layers-dir <PATH>` to override the default location.
-
-### List layers
-
 ```powershell
-dcmfree list
+dcmfree                 # open the GUI (default)
+dcmfree list            # CLI: table of every layer
+dcmfree info [--json]   # CLI: summary stats
+dcmfree clean [opts]    # CLI: destroy orphan layers (admin required)
+dcmfree /?              # help
 ```
 
-Shows every direct subfolder of the layers directory with size, age, orphan
-status (cross-referenced against `docker images` and `docker ps -a` if Docker
-is on `PATH`), and the layer ID.
+`clean` options: `--dry-run`, `--yes`, `--min-age 7d`, `--layers-dir
+<PATH>`.
 
-### Summary
-
-```powershell
-dcmfree info
-dcmfree info --json
-```
-
-Reports total layer count, orphan count, total size, and reclaimable size.
-
-### Clean (destructive)
-
-```powershell
-# Show what would be destroyed without doing anything:
-dcmfree clean --dry-run
-
-# Destroy orphan layers older than 7 days, no prompt:
-dcmfree clean --min-age 7d --yes
-```
-
-`clean` requires:
-
-- **Administrator** (HCS APIs reject unelevated callers).
-- `SeBackupPrivilege` / `SeRestorePrivilege` (dcmfree enables these
-  automatically — they're present on admin tokens but disabled by default).
-
-Default `--min-age` is 1 day, which keeps `dcmfree` from racing against an
-in-progress container operation. Pass `--min-age 0` to disable the age guard.
+Both the GUI and `clean` need an elevated process. The GUI shows a
+confirm dialog and lets you cancel mid-destroy.
 
 ## Safety
 
-- `dcmfree` never destroys a layer that Docker (in the current daemon mode)
-  reports as in-use, when the Docker CLI is on `PATH`.
-- If Docker isn't available, every layer is treated as potentially orphan and
-  the user is warned via `--verbose`.
-- `clean` always prints the destruction plan first; without `--yes` it asks
-  for confirmation on a TTY, and aborts cleanly on non-TTY stdin.
-- Layers newer than `--min-age` are excluded by default.
-- `clean` does nothing on non-Windows platforms (the HCS APIs are
-  Windows-only).
+- Cross-references Docker (in its current daemon mode) and skips layers
+  Docker reports as in-use.
+- CLI's `--min-age` (default 1 day) excludes recently-touched layers.
+- Every Win32 handle is RAII-wrapped (`OwnedToken`, `HcsOperation`,
+  `OwnedLocalAlloc`) — handles cannot leak even on panic.
+- All destructive paths are gated by an explicit confirm.
 
-## Why this tool exists
+## Why
 
-Microsoft's `docker-ci-zap` (and the [arcanericky fork](https://github.com/arcanericky/dockercizap))
-target `C:\ProgramData\Docker\windowsfilter` — the *legacy* Docker Engine for
-Windows layer store. They don't touch the HCS-managed
-`Microsoft\Windows\Containers\Layers` location used by modern Docker Desktop,
-Windows Sandbox, and Hyper-V isolated containers.
+Tools like `docker-ci-zap` target the legacy
+`C:\ProgramData\Docker\windowsfilter` store, not the HCS-managed
+`Microsoft\Windows\Containers\Layers` used by modern Docker, Windows
+Sandbox, and Hyper-V isolated containers. As of mid-2026, no maintained
+off-the-shelf tool cleaned this specific path.
 
-PowerShell scripts that just `Remove-Item -Recurse -Force` silently fail on
-the layer trees because each one contains junctions and reparse points that
-require backup/restore privilege to traverse. `Remove-Item` reports "Remove
-Directory" lines as if working, then leaves most of the data behind.
-
-`dcmfree` exists because, as of mid-2026, no maintained off-the-shelf tool
-targeted this specific cleanup path.
-
-## How it works
-
-1. **Enumerate** subdirectories of the layers folder, compute size + mtime.
-2. **Classify** each layer as orphan or in-use by cross-referencing
-   `docker images --no-trunc -q` and `docker ps -a -q --no-trunc` with
-   `docker inspect` `GraphDriver.Data.dir`.
-3. **Filter** to orphans older than `--min-age`.
-4. **Acquire** `SeBackupPrivilege` + `SeRestorePrivilege` via
-   `AdjustTokenPrivileges`.
-5. **Destroy** each target via `HcsDestroyLayer` from `computestorage.dll`.
-
-## Limitations
-
-- Windows-only. The HCS APIs are Windows-only and so is this tool; it does
-  not build on other platforms.
-- Cannot reclaim a layer that is genuinely being held open by a running
-  container or service; in that case the HCS call fails with a busy/locked
-  HRESULT, which is reported verbatim.
-- Trusts Docker's `GraphDriver.Data.dir` field when present. Old Docker
-  versions may report different shapes; the JSON parser is permissive and
-  skips records it can't interpret.
-
-## Building / testing
+## Build / test
 
 ```powershell
-cargo build
-cargo test                # unit + integration tests against fake layer trees
-cargo clippy -- -D warnings
 cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-The integration tests in `tests/cli.rs` invoke the built binary against
-temporary directories of fake layers — they never call `HcsDestroyLayer`, so
-they're safe to run on any machine.
-
-## Releasing
-
-Push a `v*` tag (e.g. `v0.1.0`). The
-[`release.yml`](.github/workflows/release.yml) workflow builds a signed
-`dcmfree.exe` on a Windows runner and attaches it to a GitHub Release.
+Integration tests use `tempfile::TempDir` only and never call into HCS,
+so they're safe on any machine.
 
 ## License
 
