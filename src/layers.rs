@@ -64,7 +64,7 @@ pub fn enumerate(dir: &Path) -> Result<Vec<LayerInfo>, DcmFreeError> {
             .to_string();
         out.push(stat_layer(path, id));
     }
-    out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    out.sort_by_key(|l| std::cmp::Reverse(l.size_bytes));
     Ok(out)
 }
 
